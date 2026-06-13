@@ -1,0 +1,168 @@
+"""
+Run this once to generate wc_players.csv before deploying the Streamlit app.
+
+  pip install statsbombpy pandas scikit-learn
+  python generate_data.py
+
+Fetches from StatsBomb open data (~5 min), saves wc_players.csv alongside this file.
+Commit wc_players.csv to your GitHub repo so the deployed app loads instantly.
+"""
+
+from statsbombpy import sb
+import pandas as pd
+import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+import warnings
+
+warnings.filterwarnings("ignore")
+
+CLUSTER_LABELS = {
+    0: "Possession Mid",
+    1: "Defender",
+    2: "Attacking Forward/Winger",
+    3: "Box-to-Box Mid",
+    4: "Target Forward",
+}
+
+FEAT = ["shots_p90", "xg_p90", "passes_p90", "pass_pct", "kp_p90",
+        "carries_p90", "press_p90", "drib_p90", "def_p90"]
+
+
+# ─── Helper: per-player stats from a set of matches ──────────────────────────
+def build_player_df(matches, source_label):
+    records = []
+    total = len(matches)
+    for i, (_, row) in enumerate(matches.iterrows()):
+        if (i + 1) % 10 == 0 or i == 0:
+            print(f"  [{source_label}] {i + 1}/{total} matches loaded…")
+        try:
+            events = sb.events(match_id=row["match_id"])
+        except Exception as e:
+            print(f"  skipping match {row['match_id']}: {e}")
+            continue
+
+        for team in [row["home_team"], row["away_team"]]:
+            te = events[events["team"] == team]
+            for player in te["player"].dropna().unique():
+                pe = te[te["player"] == player]
+                mins = pe["minute"].max()
+                if mins < 10:
+                    continue
+                records.append({
+                    "player":            player,
+                    "team":              team,
+                    "position":          pe["position"].mode()[0] if not pe["position"].dropna().empty else "Unknown",
+                    "minutes":           mins,
+                    "shots":             len(pe[pe["type"] == "Shot"]),
+                    "goals":             int(pe.get("shot_outcome", pd.Series(dtype=str)).eq("Goal").sum()),
+                    "xg":                pe["shot_statsbomb_xg"].sum() if "shot_statsbomb_xg" in pe.columns else 0,
+                    "passes":            len(pe[pe["type"] == "Pass"]),
+                    "passes_completed":  pe["pass_outcome"].isna().sum() if "pass_outcome" in pe.columns else 0,
+                    "key_passes":        int(pe.get("pass_shot_assist", pd.Series(dtype=float)).fillna(0).sum()),
+                    "assists":           int(pe.get("pass_goal_assist", pd.Series(dtype=float)).fillna(0).sum()),
+                    "carries":           len(pe[pe["type"] == "Carry"]),
+                    "pressures":         len(pe[pe["type"] == "Pressure"]),
+                    "dribbles":          len(pe[pe["type"] == "Dribble"]),
+                    "drib_success":      int((pe.get("dribble_outcome", pd.Series(dtype=str)) == "Complete").sum()),
+                    "defensive_actions": len(pe[pe["type"].isin(["Duel", "Block", "Ball Recovery", "Clearance"])]),
+                })
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    num_cols = ["shots", "goals", "xg", "passes", "passes_completed", "key_passes",
+                "assists", "carries", "pressures", "dribbles", "drib_success",
+                "defensive_actions", "minutes"]
+    df = df.groupby("player", as_index=False).agg(
+        {**{c: "sum" for c in num_cols}, "position": "first", "team": "first"}
+    )
+    m90 = df["minutes"] / 90
+    df["pass_pct"]    = (df["passes_completed"] / df["passes"].replace(0, np.nan) * 100).fillna(0)
+    df["shots_p90"]   = df["shots"]            / m90
+    df["goals_p90"]   = df["goals"]            / m90
+    df["xg_p90"]      = df["xg"]               / m90
+    df["passes_p90"]  = df["passes"]           / m90
+    df["kp_p90"]      = df["key_passes"]       / m90
+    df["assists_p90"] = df["assists"]          / m90
+    df["carries_p90"] = df["carries"]          / m90
+    df["press_p90"]   = df["pressures"]        / m90
+    df["drib_p90"]    = df["dribbles"]         / m90
+    df["def_p90"]     = df["defensive_actions"] / m90
+    df["source"]      = source_label
+    return df
+
+
+def assign_roles(df, km_model):
+    out = df[df["position"] != "Goalkeeper"].copy()
+    gk  = df[df["position"] == "Goalkeeper"].copy()
+    if not out.empty:
+        Xs = StandardScaler().fit_transform(out[FEAT].fillna(0))
+        out["cluster"] = km_model.predict(Xs)
+        out["role"]    = out["cluster"].map(CLUSTER_LABELS)
+    gk["cluster"] = -1
+    gk["role"]    = "Goalkeeper"
+    return pd.concat([out, gk], ignore_index=True)
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("Fetching StatsBomb competition list…")
+    comps = sb.competitions()
+
+    # ── WC 2022 ──
+    print("\n=== FIFA World Cup 2022 (64 matches) ===")
+    wc_matches = sb.matches(competition_id=43, season_id=106)
+    wc_df = build_player_df(wc_matches, "WC 2022")
+    wc_df = wc_df[wc_df["minutes"] >= 45].reset_index(drop=True)
+    print(f"  → {len(wc_df)} players (≥45 min)")
+
+    # Fit KMeans on WC 2022 outfield players
+    out_wc = wc_df[wc_df["position"] != "Goalkeeper"].copy()
+    X  = out_wc[FEAT].fillna(0).values
+    Xs = StandardScaler().fit_transform(X)
+    km = KMeans(n_clusters=5, random_state=42, n_init=10)
+    out_wc["cluster"] = km.fit_predict(Xs)
+    out_wc["role"]    = out_wc["cluster"].map(CLUSTER_LABELS)
+    gk_wc = wc_df[wc_df["position"] == "Goalkeeper"].copy()
+    gk_wc["cluster"] = -1
+    gk_wc["role"]    = "Goalkeeper"
+    wc_final = pd.concat([out_wc, gk_wc], ignore_index=True)
+
+    # ── Euro 2024 ──
+    print("\n=== UEFA Euro 2024 ===")
+    euro_row = comps[
+        comps["competition_name"].str.contains("UEFA Euro", na=False) &
+        (comps["season_name"] == "2024")
+    ].iloc[0]
+    euro_matches = sb.matches(
+        competition_id=int(euro_row["competition_id"]),
+        season_id=int(euro_row["season_id"])
+    )
+    euro_df = build_player_df(euro_matches, "Euro 2024")
+    euro_df = euro_df[euro_df["minutes"] >= 10].reset_index(drop=True)
+    euro_df = assign_roles(euro_df, km)
+    print(f"  → {len(euro_df)} players")
+
+    # ── Copa 2024 ──
+    print("\n=== Copa América 2024 ===")
+    copa_row = comps[
+        comps["competition_name"].str.contains("Copa America", case=False, na=False) &
+        (comps["season_name"] == "2024")
+    ].iloc[0]
+    copa_matches = sb.matches(
+        competition_id=int(copa_row["competition_id"]),
+        season_id=int(copa_row["season_id"])
+    )
+    copa_df = build_player_df(copa_matches, "Copa 2024")
+    copa_df = copa_df[copa_df["minutes"] >= 10].reset_index(drop=True)
+    copa_df = assign_roles(copa_df, km)
+    print(f"  → {len(copa_df)} players")
+
+    # ── Combine & save ──
+    combined = pd.concat([wc_final, euro_df, copa_df], ignore_index=True, sort=False)
+    out_path = "wc_players.csv"
+    combined.to_csv(out_path, index=False)
+    print(f"\n✅ Saved {len(combined)} rows to {out_path}")
+    print("   Commit this file to your GitHub repo before deploying.")
