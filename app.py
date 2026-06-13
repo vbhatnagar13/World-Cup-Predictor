@@ -7,6 +7,7 @@ import unicodedata
 from pathlib import Path
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -60,28 +61,154 @@ RADAR_LABELS = ['Shots/90', 'xG/90', 'KP/90', 'Pass %',
                 'Carries/90', 'Dribbles/90', 'Press/90', 'Def/90']
 
 # ─── DATA LOADING ────────────────────────────────────────────────────────────
-@st.cache_data(show_spinner=False)
-def load_data():
-    csv_path = Path(__file__).parent / "wc_players.csv"
-    if not csv_path.exists():
-        return None
+FEAT = ['shots_p90', 'xg_p90', 'passes_p90', 'pass_pct', 'kp_p90',
+        'carries_p90', 'press_p90', 'drib_p90', 'def_p90']
 
-    df = pd.read_csv(csv_path)
+CLUSTER_LABELS = {
+    0: 'Possession Mid', 1: 'Defender', 2: 'Attacking Forward/Winger',
+    3: 'Box-to-Box Mid', 4: 'Target Forward',
+}
 
-    # Normalise column name differences between WC/Euro/Copa slices
+
+def _build_player_df(matches, source_label, progress_bar, progress_start, progress_end):
+    from statsbombpy import sb
+    records = []
+    total = len(matches)
+    for i, (_, row) in enumerate(matches.iterrows()):
+        progress_bar.progress(
+            progress_start + (progress_end - progress_start) * i / total,
+            text=f"Loading {source_label}: match {i+1}/{total}…"
+        )
+        try:
+            events = sb.events(match_id=row['match_id'])
+        except Exception:
+            continue
+        for team in [row['home_team'], row['away_team']]:
+            te = events[events['team'] == team]
+            for player in te['player'].dropna().unique():
+                pe = te[te['player'] == player]
+                mins = pe['minute'].max()
+                if mins < 10:
+                    continue
+                records.append({
+                    'player':            player,
+                    'team':              team,
+                    'position':          pe['position'].mode()[0] if not pe['position'].dropna().empty else 'Unknown',
+                    'minutes':           mins,
+                    'shots':             len(pe[pe['type'] == 'Shot']),
+                    'goals':             int(pe.get('shot_outcome', pd.Series(dtype=str)).eq('Goal').sum()),
+                    'xg':                pe['shot_statsbomb_xg'].sum() if 'shot_statsbomb_xg' in pe.columns else 0,
+                    'passes':            len(pe[pe['type'] == 'Pass']),
+                    'passes_completed':  pe['pass_outcome'].isna().sum() if 'pass_outcome' in pe.columns else 0,
+                    'key_passes':        int(pe.get('pass_shot_assist', pd.Series(dtype=float)).fillna(0).sum()),
+                    'assists':           int(pe.get('pass_goal_assist', pd.Series(dtype=float)).fillna(0).sum()),
+                    'carries':           len(pe[pe['type'] == 'Carry']),
+                    'pressures':         len(pe[pe['type'] == 'Pressure']),
+                    'dribbles':          len(pe[pe['type'] == 'Dribble']),
+                    'drib_success':      int((pe.get('dribble_outcome', pd.Series(dtype=str)) == 'Complete').sum()),
+                    'defensive_actions': len(pe[pe['type'].isin(['Duel', 'Block', 'Ball Recovery', 'Clearance'])]),
+                })
+    if not records:
+        return pd.DataFrame()
+    df = pd.DataFrame(records)
+    num_cols = ['shots', 'goals', 'xg', 'passes', 'passes_completed', 'key_passes',
+                'assists', 'carries', 'pressures', 'dribbles', 'drib_success',
+                'defensive_actions', 'minutes']
+    df = df.groupby('player', as_index=False).agg(
+        {**{c: 'sum' for c in num_cols}, 'position': 'first', 'team': 'first'}
+    )
+    m90 = df['minutes'] / 90
+    df['pass_pct']    = (df['passes_completed'] / df['passes'].replace(0, np.nan) * 100).fillna(0)
+    df['shots_p90']   = df['shots']            / m90
+    df['goals_p90']   = df['goals']            / m90
+    df['xg_p90']      = df['xg']               / m90
+    df['passes_p90']  = df['passes']           / m90
+    df['kp_p90']      = df['key_passes']       / m90
+    df['assists_p90'] = df['assists']          / m90
+    df['carries_p90'] = df['carries']          / m90
+    df['press_p90']   = df['pressures']        / m90
+    df['drib_p90']    = df['dribbles']         / m90
+    df['def_p90']     = df['defensive_actions'] / m90
+    df['source']      = source_label
+    return df
+
+
+def _assign_roles(df, km_model):
+    out = df[df['position'] != 'Goalkeeper'].copy()
+    gk  = df[df['position'] == 'Goalkeeper'].copy()
+    if not out.empty:
+        Xs = StandardScaler().fit_transform(out[FEAT].fillna(0))
+        out['cluster'] = km_model.predict(Xs)
+        out['role']    = out['cluster'].map(CLUSTER_LABELS)
+    gk['cluster'] = -1
+    gk['role'] = 'Goalkeeper'
+    return pd.concat([out, gk], ignore_index=True)
+
+
+def _normalise(df):
     if 'pressures_p90' in df.columns and 'press_p90' not in df.columns:
         df['press_p90'] = df['pressures_p90']
     if 'assists_p90' not in df.columns:
         df['assists_p90'] = 0.0
-
     p90_cols = ['shots_p90', 'xg_p90', 'goals_p90', 'passes_p90', 'kp_p90',
                 'assists_p90', 'carries_p90', 'press_p90', 'drib_p90', 'def_p90', 'pass_pct']
     for col in p90_cols:
         if col not in df.columns:
             df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
     return df
+
+
+@st.cache_data(show_spinner=False)
+def load_data():
+    # Fast path: CSV already in repo
+    csv_path = Path(__file__).parent / "wc_players.csv"
+    if csv_path.exists():
+        return _normalise(pd.read_csv(csv_path))
+
+    # Slow path: fetch from StatsBomb open data (~5 min, cached after first run)
+    from statsbombpy import sb
+    bar = st.progress(0, text="Connecting to StatsBomb…")
+    comps = sb.competitions()
+
+    bar.progress(0.02, text="Loading WC 2022 matches…")
+    wc_matches = sb.matches(competition_id=43, season_id=106)
+    wc_df = _build_player_df(wc_matches, 'WC 2022', bar, 0.03, 0.45)
+    wc_df = wc_df[wc_df['minutes'] >= 45].reset_index(drop=True)
+
+    out_wc = wc_df[wc_df['position'] != 'Goalkeeper'].copy()
+    X = StandardScaler().fit_transform(out_wc[FEAT].fillna(0))
+    km = KMeans(n_clusters=5, random_state=42, n_init=10)
+    out_wc['cluster'] = km.fit_predict(X)
+    out_wc['role'] = out_wc['cluster'].map(CLUSTER_LABELS)
+    gk_wc = wc_df[wc_df['position'] == 'Goalkeeper'].copy()
+    gk_wc['cluster'] = -1
+    gk_wc['role'] = 'Goalkeeper'
+    wc_final = pd.concat([out_wc, gk_wc], ignore_index=True)
+
+    bar.progress(0.46, text="Loading Euro 2024 matches…")
+    euro_row = comps[comps['competition_name'].str.contains('UEFA Euro', na=False) &
+                     (comps['season_name'] == '2024')].iloc[0]
+    euro_matches = sb.matches(competition_id=int(euro_row['competition_id']),
+                              season_id=int(euro_row['season_id']))
+    euro_df = _build_player_df(euro_matches, 'Euro 2024', bar, 0.47, 0.72)
+    euro_df = euro_df[euro_df['minutes'] >= 10].reset_index(drop=True)
+    euro_df = _assign_roles(euro_df, km)
+
+    bar.progress(0.73, text="Loading Copa América 2024 matches…")
+    copa_row = comps[comps['competition_name'].str.contains('Copa America', case=False, na=False) &
+                     (comps['season_name'] == '2024')].iloc[0]
+    copa_matches = sb.matches(competition_id=int(copa_row['competition_id']),
+                              season_id=int(copa_row['season_id']))
+    copa_df = _build_player_df(copa_matches, 'Copa 2024', bar, 0.74, 0.97)
+    copa_df = copa_df[copa_df['minutes'] >= 10].reset_index(drop=True)
+    copa_df = _assign_roles(copa_df, km)
+
+    bar.progress(0.98, text="Combining datasets…")
+    combined = pd.concat([wc_final, euro_df, copa_df], ignore_index=True, sort=False)
+    bar.progress(1.0, text="Done!")
+    bar.empty()
+    return _normalise(combined)
 
 
 @st.cache_data(show_spinner=False)
@@ -391,20 +518,7 @@ def main():
         )
         st.markdown("---")
 
-    with st.spinner("Loading player data…"):
-        df = load_data()
-
-    if df is None:
-        st.error("**`wc_players.csv` not found.**")
-        st.markdown("""
-Run the data pipeline first:
-```bash
-pip install statsbombpy pandas scikit-learn
-python generate_data.py
-```
-Then restart the app.
-        """)
-        return
+    df = load_data()
 
     with st.sidebar:
         st.caption(f"📊 {len(df):,} records")
